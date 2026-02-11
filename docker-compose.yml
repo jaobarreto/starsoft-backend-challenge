@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      target: development
+    container_name: cinema-api
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    command: npm run start:dev
+    networks:
+      - cinema-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cinema-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-cinema_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-cinema_pass}
+      POSTGRES_DB: ${DB_DATABASE:-cinema_db}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - cinema-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: cinema-redis
+    restart: always
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - cinema-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cinema-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-cinema_user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-cinema_pass}
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - cinema-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  cinema-network:
+    driver: bridge
