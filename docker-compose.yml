@@ -63,10 +63,26 @@ services:
     networks:
       - cinema-network
 
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: cinema-postgres-test
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cinema_test
+    ports:
+      - '5433:5432'
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    networks:
+      - cinema-network
+
 volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
+  postgres_test_data:
 
 networks:
   cinema-network:
