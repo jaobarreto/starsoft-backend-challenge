@@ -91,7 +91,13 @@ export class ReservationsService implements OnModuleInit {
       return;
     }
 
-    const payload = JSON.stringify({ reservationId });
+    // NestJS microservices expects messages in this format
+    const message = {
+      pattern: EXPIRATION_ROUTING_KEY,
+      data: { reservationId },
+    };
+
+    const payload = JSON.stringify(message);
     this.amqpChannel.publish(EXPIRATION_EXCHANGE, EXPIRATION_ROUTING_KEY, Buffer.from(payload), {
       persistent: true,
       expiration: String(delayMs), // per-message TTL in ms
