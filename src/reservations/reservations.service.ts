@@ -1,12 +1,13 @@
 import { Injectable, Logger, NotFoundException, BadRequestException, Inject, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, QueryFailedError } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { ClientProxy } from '@nestjs/microservices';
 import { Reservation, Seat, Session, Sale, SeatStatus, ReservationStatus } from '../entities';
 import { CreateReservationDto, ReservationResponseDto, ConfirmPaymentDto } from '../dto/reservation.dto';
 import { SaleResponseDto } from '../dto/sale.dto';
 import { connect, type Channel, type ChannelModel } from 'amqplib';
+import { retryWithBackoff } from '../utils/retry.util';
 
 // DLX + TTL queue constants
 const EXPIRATION_EXCHANGE = 'reservation.expiration.exchange';
@@ -107,259 +108,293 @@ export class ReservationsService implements OnModuleInit {
       `Creating reservation for user ${createReservationDto.userId} - Seats: ${sortedSeatNumbers.join(', ')}`,
     );
 
-    // Start a transaction with pessimistic locking
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
+    // Use retry with exponential backoff for database operations
+    // Handles deadlocks, lock timeouts, and transient connection issues
+    return retryWithBackoff(
+      async () => {
+        // Start a transaction with pessimistic locking
+        const queryRunner = this.dataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
 
-    try {
-      const session = await queryRunner.manager.findOne(Session, {
-        where: { id: createReservationDto.sessionId },
-      });
+        try {
+          const session = await queryRunner.manager.findOne(Session, {
+            where: { id: createReservationDto.sessionId },
+          });
 
-      if (!session) {
-        throw new NotFoundException(`Session ${createReservationDto.sessionId} not found`);
-      }
+          if (!session) {
+            throw new NotFoundException(`Session ${createReservationDto.sessionId} not found`);
+          }
 
-      const reservations: ReservationResponseDto[] = [];
-      const expiresAt = new Date(Date.now() + this.reservationTtl * 1000);
+          const reservations: ReservationResponseDto[] = [];
+          const expiresAt = new Date(Date.now() + this.reservationTtl * 1000);
 
-      for (const seatNumber of sortedSeatNumbers) {
-        // Lock the seat row with SELECT FOR UPDATE to prevent race conditions
-        const seat = await queryRunner.manager
-          .createQueryBuilder(Seat, 'seat')
-          .setLock('pessimistic_write')
-          .where('seat.sessionId = :sessionId', { sessionId: session.id })
-          .andWhere('seat.seatNumber = :seatNumber', { seatNumber })
-          .getOne();
+          for (const seatNumber of sortedSeatNumbers) {
+            // Lock the seat row with SELECT FOR UPDATE to prevent race conditions
+            const seat = await queryRunner.manager
+              .createQueryBuilder(Seat, 'seat')
+              .setLock('pessimistic_write')
+              .where('seat.sessionId = :sessionId', { sessionId: session.id })
+              .andWhere('seat.seatNumber = :seatNumber', { seatNumber })
+              .getOne();
 
-        if (!seat) {
-          throw new NotFoundException(`Seat ${seatNumber} not found in session ${session.id}`);
+            if (!seat) {
+              throw new NotFoundException(`Seat ${seatNumber} not found in session ${session.id}`);
+            }
+
+            if (seat.status !== SeatStatus.AVAILABLE) {
+              throw new BadRequestException(`Seat ${seatNumber} is not available (current status: ${seat.status})`);
+            }
+
+            // Update seat status
+            seat.status = SeatStatus.RESERVED;
+            await queryRunner.manager.save(Seat, seat);
+
+            // Create reservation
+            const reservation = queryRunner.manager.create(Reservation, {
+              seatId: seat.id,
+              userId: createReservationDto.userId,
+              status: ReservationStatus.PENDING,
+              expiresAt,
+            });
+
+            const savedReservation = await queryRunner.manager.save(Reservation, reservation);
+
+            reservations.push({
+              id: savedReservation.id,
+              seatId: seat.id,
+              seatNumber: seat.seatNumber,
+              userId: savedReservation.userId,
+              status: savedReservation.status,
+              expiresAt: savedReservation.expiresAt,
+              createdAt: savedReservation.createdAt,
+            });
+          }
+
+          await queryRunner.commitTransaction();
+
+          // After commit: publish events and schedule expiration via DLX
+          for (const res of reservations) {
+            this.rabbitClient.emit('reservation.created', {
+              reservationId: res.id,
+              seatId: res.seatId,
+              seatNumber: res.seatNumber,
+              userId: res.userId,
+              expiresAt: res.expiresAt,
+              timestamp: new Date(),
+            });
+
+            // Schedule delayed expiration via DLX + TTL
+            this.publishDelayedExpiration(res.id, this.reservationTtl * 1000);
+          }
+
+          this.logger.log(`Reservations created successfully: ${reservations.map((r) => r.id).join(', ')}`);
+
+          return reservations;
+        } catch (error) {
+          await queryRunner.rollbackTransaction();
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          this.logger.error(`Failed to create reservation: ${errorMessage}`, errorStack);
+          throw error;
+        } finally {
+          await queryRunner.release();
         }
-
-        if (seat.status !== SeatStatus.AVAILABLE) {
-          throw new BadRequestException(`Seat ${seatNumber} is not available (current status: ${seat.status})`);
-        }
-
-        // Update seat status
-        seat.status = SeatStatus.RESERVED;
-        await queryRunner.manager.save(Seat, seat);
-
-        // Create reservation
-        const reservation = queryRunner.manager.create(Reservation, {
-          seatId: seat.id,
-          userId: createReservationDto.userId,
-          status: ReservationStatus.PENDING,
-          expiresAt,
-        });
-
-        const savedReservation = await queryRunner.manager.save(Reservation, reservation);
-
-        reservations.push({
-          id: savedReservation.id,
-          seatId: seat.id,
-          seatNumber: seat.seatNumber,
-          userId: savedReservation.userId,
-          status: savedReservation.status,
-          expiresAt: savedReservation.expiresAt,
-          createdAt: savedReservation.createdAt,
-        });
-      }
-
-      await queryRunner.commitTransaction();
-
-      // After commit: publish events and schedule expiration via DLX
-      for (const res of reservations) {
-        this.rabbitClient.emit('reservation.created', {
-          reservationId: res.id,
-          seatId: res.seatId,
-          seatNumber: res.seatNumber,
-          userId: res.userId,
-          expiresAt: res.expiresAt,
-          timestamp: new Date(),
-        });
-
-        // Schedule delayed expiration via DLX + TTL
-        this.publishDelayedExpiration(res.id, this.reservationTtl * 1000);
-      }
-
-      this.logger.log(`Reservations created successfully: ${reservations.map((r) => r.id).join(', ')}`);
-
-      return reservations;
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      const errorStack = error instanceof Error ? error.stack : undefined;
-      this.logger.error(`Failed to create reservation: ${errorMessage}`, errorStack);
-      throw error;
-    } finally {
-      await queryRunner.release();
-    }
+      },
+      {
+        maxAttempts: 3,
+        initialDelayMs: 100,
+        maxDelayMs: 2000,
+        backoffMultiplier: 2,
+        retryableErrors: [QueryFailedError],
+        onRetry: (error, attempt, delayMs) => {
+          this.logger.warn(
+            `Retry attempt ${attempt} for createReservation after ${delayMs}ms. Error: ${error.message}`,
+          );
+        },
+      },
+    );
   }
 
   async confirmPayment(confirmPaymentDto: ConfirmPaymentDto): Promise<SaleResponseDto> {
     this.logger.log(`Confirming payment for reservation ${confirmPaymentDto.reservationId}`);
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
+    // Use retry with exponential backoff for database operations
+    // Handles deadlocks, lock timeouts, and transient connection issues
+    return retryWithBackoff(
+      async () => {
+        const queryRunner = this.dataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
 
-    try {
-      // Pessimistic lock on reservation + joined seat + session
-      const reservation = await queryRunner.manager
-        .createQueryBuilder(Reservation, 'reservation')
-        .setLock('pessimistic_write')
-        .innerJoinAndSelect('reservation.seat', 'seat')
-        .innerJoinAndSelect('seat.session', 'session')
-        .where('reservation.id = :id', { id: confirmPaymentDto.reservationId })
-        .andWhere('reservation.userId = :userId', { userId: confirmPaymentDto.userId })
-        .getOne();
+        try {
+          // Pessimistic lock on reservation + joined seat + session
+          const reservation = await queryRunner.manager
+            .createQueryBuilder(Reservation, 'reservation')
+            .setLock('pessimistic_write')
+            .innerJoinAndSelect('reservation.seat', 'seat')
+            .innerJoinAndSelect('seat.session', 'session')
+            .where('reservation.id = :id', { id: confirmPaymentDto.reservationId })
+            .andWhere('reservation.userId = :userId', { userId: confirmPaymentDto.userId })
+            .getOne();
 
-      if (!reservation) {
-        throw new NotFoundException(`Reservation ${confirmPaymentDto.reservationId} not found`);
-      }
+          if (!reservation) {
+            throw new NotFoundException(`Reservation ${confirmPaymentDto.reservationId} not found`);
+          }
 
-      // Idempotency: if already confirmed, return existing sale
-      if (reservation.status === ReservationStatus.CONFIRMED) {
-        const existingSale = await queryRunner.manager.findOne(Sale, {
-          where: { reservationId: reservation.id },
-          relations: ['seat', 'seat.session'],
-        });
+          // Idempotency: if already confirmed, return existing sale
+          if (reservation.status === ReservationStatus.CONFIRMED) {
+            const existingSale = await queryRunner.manager.findOne(Sale, {
+              where: { reservationId: reservation.id },
+              relations: ['seat', 'seat.session'],
+            });
 
-        await queryRunner.commitTransaction();
+            await queryRunner.commitTransaction();
 
-        if (!existingSale) {
-          throw new BadRequestException('Reservation is confirmed but sale record not found');
-        }
+            if (!existingSale) {
+              throw new BadRequestException('Reservation is confirmed but sale record not found');
+            }
 
-        this.logger.log(`Idempotent confirmPayment: reservation ${reservation.id} already confirmed`);
+            this.logger.log(`Idempotent confirmPayment: reservation ${reservation.id} already confirmed`);
 
-        return {
-          id: existingSale.id,
-          seatId: existingSale.seatId,
-          seatNumber: existingSale.seat.seatNumber,
-          userId: existingSale.userId,
-          reservationId: existingSale.reservationId,
-          amount: Number(existingSale.amount),
-          movieName: existingSale.seat.session.movieName,
-          sessionStartTime: existingSale.seat.session.startTime,
-          roomNumber: existingSale.seat.session.roomNumber,
-          paidAt: existingSale.paidAt,
-          createdAt: existingSale.createdAt,
-        };
-      }
+            return {
+              id: existingSale.id,
+              seatId: existingSale.seatId,
+              seatNumber: existingSale.seat.seatNumber,
+              userId: existingSale.userId,
+              reservationId: existingSale.reservationId,
+              amount: Number(existingSale.amount),
+              movieName: existingSale.seat.session.movieName,
+              sessionStartTime: existingSale.seat.session.startTime,
+              roomNumber: existingSale.seat.session.roomNumber,
+              paidAt: existingSale.paidAt,
+              createdAt: existingSale.createdAt,
+            };
+          }
 
-      if (reservation.status !== ReservationStatus.PENDING) {
-        throw new BadRequestException(`Reservation is not pending (status: ${reservation.status})`);
-      }
+          if (reservation.status !== ReservationStatus.PENDING) {
+            throw new BadRequestException(`Reservation is not pending (status: ${reservation.status})`);
+          }
 
-      if (new Date() > reservation.expiresAt) {
-        throw new BadRequestException('Reservation has expired');
-      }
+          if (new Date() > reservation.expiresAt) {
+            throw new BadRequestException('Reservation has expired');
+          }
 
-      // Find all reservations from the same booking group (same user, session, and expiresAt)
-      // When a user reserves multiple seats together, they all have the same expiresAt timestamp
-      const relatedReservations = await queryRunner.manager
-        .createQueryBuilder(Reservation, 'reservation')
-        .setLock('pessimistic_write')
-        .innerJoinAndSelect('reservation.seat', 'seat')
-        .innerJoinAndSelect('seat.session', 'session')
-        .where('reservation.userId = :userId', { userId: reservation.userId })
-        .andWhere('seat.sessionId = :sessionId', { sessionId: reservation.seat.sessionId })
-        .andWhere('reservation.expiresAt = :expiresAt', { expiresAt: reservation.expiresAt })
-        .andWhere('reservation.status = :status', { status: ReservationStatus.PENDING })
-        .getMany();
+          // Find all reservations from the same booking group (same user, session, and expiresAt)
+          // When a user reserves multiple seats together, they all have the same expiresAt timestamp
+          const relatedReservations = await queryRunner.manager
+            .createQueryBuilder(Reservation, 'reservation')
+            .setLock('pessimistic_write')
+            .innerJoinAndSelect('reservation.seat', 'seat')
+            .innerJoinAndSelect('seat.session', 'session')
+            .where('reservation.userId = :userId', { userId: reservation.userId })
+            .andWhere('seat.sessionId = :sessionId', { sessionId: reservation.seat.sessionId })
+            .andWhere('reservation.expiresAt = :expiresAt', { expiresAt: reservation.expiresAt })
+            .andWhere('reservation.status = :status', { status: ReservationStatus.PENDING })
+            .getMany();
 
-      this.logger.log(
-        `Confirming ${relatedReservations.length} reservations from the same booking group: ${relatedReservations.map((r) => r.id).join(', ')}`,
-      );
+          this.logger.log(
+            `Confirming ${relatedReservations.length} reservations from the same booking group: ${relatedReservations.map((r) => r.id).join(', ')}`,
+          );
 
-      const sales: Sale[] = [];
-      const paidAt = new Date();
+          const sales: Sale[] = [];
+          const paidAt = new Date();
 
-      // Confirm all related reservations and create sales
-      for (const res of relatedReservations) {
-        // Update reservation status
-        res.status = ReservationStatus.CONFIRMED;
-        await queryRunner.manager.save(Reservation, res);
+          // Confirm all related reservations and create sales
+          for (const res of relatedReservations) {
+            // Update reservation status
+            res.status = ReservationStatus.CONFIRMED;
+            await queryRunner.manager.save(Reservation, res);
 
-        // Update seat status
-        res.seat.status = SeatStatus.SOLD;
-        await queryRunner.manager.save(Seat, res.seat);
+            // Update seat status
+            res.seat.status = SeatStatus.SOLD;
+            await queryRunner.manager.save(Seat, res.seat);
 
-        // Create sale record
-        const sale = queryRunner.manager.create(Sale, {
-          seatId: res.seat.id,
-          userId: res.userId,
-          reservationId: res.id,
-          amount: res.seat.session.ticketPrice,
-          paidAt,
-        });
+            // Create sale record
+            const sale = queryRunner.manager.create(Sale, {
+              seatId: res.seat.id,
+              userId: res.userId,
+              reservationId: res.id,
+              amount: res.seat.session.ticketPrice,
+              paidAt,
+            });
 
-        const savedSale = await queryRunner.manager.save(Sale, sale);
-        sales.push(savedSale);
-      }
+            const savedSale = await queryRunner.manager.save(Sale, sale);
+            sales.push(savedSale);
+          }
 
-      await queryRunner.commitTransaction();
+          await queryRunner.commitTransaction();
 
-      // Publish events to RabbitMQ for all confirmed sales
-      for (const sale of sales) {
-        const saleReservation = relatedReservations.find((r) => r.id === sale.reservationId);
-        if (saleReservation) {
-          this.rabbitClient.emit('payment.confirmed', {
-            saleId: sale.id,
-            reservationId: sale.reservationId,
-            seatId: sale.seatId,
-            seatNumber: saleReservation.seat.seatNumber,
-            userId: sale.userId,
-            amount: sale.amount,
-            timestamp: new Date(),
+          // Publish events to RabbitMQ for all confirmed sales
+          for (const sale of sales) {
+            const saleReservation = relatedReservations.find((r) => r.id === sale.reservationId);
+            if (saleReservation) {
+              this.rabbitClient.emit('payment.confirmed', {
+                saleId: sale.id,
+                reservationId: sale.reservationId,
+                seatId: sale.seatId,
+                seatNumber: saleReservation.seat.seatNumber,
+                userId: sale.userId,
+                amount: sale.amount,
+                timestamp: new Date(),
+              });
+            }
+          }
+
+          this.logger.log(
+            `Payment confirmed successfully for ${sales.length} reservations. Sale IDs: ${sales.map((s) => s.id).join(', ')}`,
+          );
+
+          // Return the sale for the originally requested reservation
+          const primarySale = sales.find((s) => s.reservationId === reservation.id);
+          if (!primarySale) {
+            throw new Error('Primary sale not found after payment confirmation');
+          }
+
+          // Reload with relations for response
+          const saleWithRelations = await this.saleRepository.findOne({
+            where: { id: primarySale.id },
+            relations: ['seat', 'seat.session'],
           });
+
+          if (!saleWithRelations) {
+            throw new Error('Sale not found after creation');
+          }
+
+          return {
+            id: saleWithRelations.id,
+            seatId: saleWithRelations.seatId,
+            seatNumber: saleWithRelations.seat.seatNumber,
+            userId: saleWithRelations.userId,
+            reservationId: saleWithRelations.reservationId,
+            amount: Number(saleWithRelations.amount),
+            movieName: saleWithRelations.seat.session.movieName,
+            sessionStartTime: saleWithRelations.seat.session.startTime,
+            roomNumber: saleWithRelations.seat.session.roomNumber,
+            paidAt: saleWithRelations.paidAt,
+            createdAt: saleWithRelations.createdAt,
+          };
+        } catch (error) {
+          await queryRunner.rollbackTransaction();
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          this.logger.error(`Failed to confirm payment: ${errorMessage}`, errorStack);
+          throw error;
+        } finally {
+          await queryRunner.release();
         }
-      }
-
-      this.logger.log(
-        `Payment confirmed successfully for ${sales.length} reservations. Sale IDs: ${sales.map((s) => s.id).join(', ')}`,
-      );
-
-      // Return the sale for the originally requested reservation
-      const primarySale = sales.find((s) => s.reservationId === reservation.id);
-      if (!primarySale) {
-        throw new Error('Primary sale not found after payment confirmation');
-      }
-
-      // Reload with relations for response
-      const saleWithRelations = await this.saleRepository.findOne({
-        where: { id: primarySale.id },
-        relations: ['seat', 'seat.session'],
-      });
-
-      if (!saleWithRelations) {
-        throw new Error('Sale not found after creation');
-      }
-
-      return {
-        id: saleWithRelations.id,
-        seatId: saleWithRelations.seatId,
-        seatNumber: saleWithRelations.seat.seatNumber,
-        userId: saleWithRelations.userId,
-        reservationId: saleWithRelations.reservationId,
-        amount: Number(saleWithRelations.amount),
-        movieName: saleWithRelations.seat.session.movieName,
-        sessionStartTime: saleWithRelations.seat.session.startTime,
-        roomNumber: saleWithRelations.seat.session.roomNumber,
-        paidAt: saleWithRelations.paidAt,
-        createdAt: saleWithRelations.createdAt,
-      };
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      const errorStack = error instanceof Error ? error.stack : undefined;
-      this.logger.error(`Failed to confirm payment: ${errorMessage}`, errorStack);
-      throw error;
-    } finally {
-      await queryRunner.release();
-    }
+      },
+      {
+        maxAttempts: 3,
+        initialDelayMs: 150,
+        maxDelayMs: 2000,
+        backoffMultiplier: 2,
+        retryableErrors: [QueryFailedError],
+        onRetry: (error, attempt, delayMs) => {
+          this.logger.warn(`Retry attempt ${attempt} for confirmPayment after ${delayMs}ms. Error: ${error.message}`);
+        },
+      },
+    );
   }
 
   /**
